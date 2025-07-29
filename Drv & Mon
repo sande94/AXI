@@ -1,0 +1,215 @@
+🧠 Your Requirement
+After sending a write transaction with ID=2, if the B response is not OK, you must stop sending further AW and W transactions.
+
+❗ Challenge:
+AXI is out-of-order
+
+You could already be sending AW/W for ID=3, ID=4, etc.
+
+But you don’t get B for ID=2 immediately
+
+So, you must monitor B channel, and block the pipeline conditionally
+
+| 🕒 Clock Cycle | **AW Channel**    | **W Channel**    | **B Channel**               | 🚦 Driver Behavior               |
+| -------------- | ----------------- | ---------------- | --------------------------- | -------------------------------- |
+| 1              | AW ID=1 Addr=0xA0 |                  |                             | Sending first address            |
+| 2              | AW ID=2 Addr=0xA4 | W ID=1 Data=0x11 |                             | Continue driving ID=2            |
+| 3              | AW ID=3 Addr=0xA8 | W ID=2 Data=0x22 |                             | Continue driving ID=3            |
+| 4              |                   | W ID=3 Data=0x33 |                             | All 3 writes issued              |
+| 5              |                   |                  | B ID=2, RESP = **SLVERR** ❗ | 🚫 ERROR for ID=2 → STOP driving |
+| 6              |                   |                  | B ID=1, RESP = OKAY         | Ignored; already halted          |
+| 7              |                   |                  |                             | 🚫 No new AW/W due to error      |
+| 8              |                   |                  | B ID=3, RESP = OKAY         | Still ignored                    |
+| 9              |                   |                  |                             | Testbench remains halted         |
+
+
+✅ Solution: Add Runtime B Response Tracking Logic
+You need to:
+
+Keep track of pending IDs
+Monitor the B response channel
+If ID == 2 and Resp != OK, raise a flag
+Check this flag before sending next AW or W
+
+-----------------------------------------------------------------------------------Use Mailbox.....................................................................
+-----------------------------------------------------------------------------------Driver...........................................................................
+bit stop_transmission = 0;
+mailbox #(packet_item) b_resp_mbx; // from monitor or driver itself
+
+task run_phase(uvm_phase phase);
+  packet_item pkt;
+
+  fork
+    monitor_b_channel();   // non-blocking B handler
+    send_aw_w_pipeline();  // address and data sender
+  join
+endtask
+
+task monitor_b_channel();
+  packet_item b_pkt;
+
+  forever begin
+    b_resp_mbx.get(b_pkt);
+
+    if (b_pkt.id == 2 && b_pkt.resp != OKAY) begin
+      `uvm_error("DRIVER", "ID=2 failed. Halting further transactions.")
+      stop_transmission = 1;
+    end
+  end
+endtask
+
+task send_aw_w_pipeline();
+  packet_item pkt;
+
+  forever begin
+    if (stop_transmission)
+      break; // Stop driving any more transactions
+
+    seq_item_port.get_next_item(pkt);
+
+    // Still drive current pkt
+    fork
+      drive_aw(pkt);
+      drive_w(pkt);
+    join
+
+    seq_item_port.item_done();
+  end
+endtask
+-----------------------------------------------------------------------------monitor mail box-----------------------------------------------------------------------
+task drive_b_channel(); // OR monitor
+  packet_item pkt;
+  forever begin
+    @(posedge clk iff vif.bvalid);
+    pkt = packet_item::type_id::create("b_pkt");
+    pkt.id = vif.bid;
+    pkt.resp = vif.bresp;
+    b_resp_mbx.put(pkt); // send to driver to checkclass axi_monitor extends uvm_monitor;
+  `uvm_component_utils(axi_monitor)
+
+  virtual axi_if vif;
+  uvm_analysis_port #(axi_tx) b_port;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+    b_port = new("b_port", this);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    if (!uvm_config_db#(virtual axi_if)::get(this, "", "vif", vif))
+      `uvm_fatal("MONITOR", "Cannot get vif handle")
+  endfunction
+
+  task run_phase(uvm_phase phase);
+    axi_tx pkt;
+    forever begin
+      @(posedge vif.clk);
+      if (vif.bvalid && vif.bready) begin
+        pkt = axi_tx::type_id::create("b_pkt", this);
+        pkt.id    = vif.bid;
+        pkt.resp  = vif.bresp;
+        b_port.write(pkt); // send response to driver
+        `uvm_info("MONITOR", $sformatf("B Channel: ID=%0d RESP=%0d", pkt.id, pkt.resp), UVM_MEDIUM)
+      end
+    end
+  endtask
+endclass
+
+  end
+endtask
+------------------------------------------------------------------------------use analysis port uvm--------------------------------------------------------------------------
+class axi_driver extends uvm_driver #(axi_tx);
+  `uvm_component_utils(axi_driver)
+
+  virtual axi_if vif;
+  mailbox #(axi_tx) b_mbx;
+  bit stop_transmission = 0;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+    b_mbx = new();
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    if (!uvm_config_db#(virtual axi_if)::get(this, "", "vif", vif))
+      `uvm_fatal("DRIVER", "Cannot get vif handle")
+  endfunction
+
+  // Called from monitor via analysis port
+  function void write(axi_tx pkt);
+    if (pkt.id == 2 && pkt.resp != 2'b00) begin // SLVERR, DECERR, etc.
+      `uvm_error("DRIVER", "ID=2 failed. Stopping further transactions.")
+      stop_transmission = 1;
+    end
+    b_mbx.put(pkt); // store for visibility if needed
+  endfunction
+
+  task run_phase(uvm_phase phase);
+    axi_tx pkt;
+    forever begin
+      if (stop_transmission) begin
+        `uvm_warning("DRIVER", "Halting due to bad response for ID=2");
+        break;
+      end
+
+      seq_item_port.get_next_item(pkt);
+
+      fork
+        drive_aw(pkt);
+        drive_w(pkt);
+      join
+
+      seq_item_port.item_done();
+    end
+  endtask
+
+  task drive_aw(axi_tx pkt);
+    @(posedge vif.clk);
+    vif.awvalid <= 1;
+    vif.awid    <= pkt.id;
+    vif.awaddr  <= pkt.addr;
+    wait (vif.awready);
+    @(posedge vif.clk);
+    vif.awvalid <= 0;
+  endtask
+
+  task drive_w(axi_tx pkt);
+    @(posedge vif.clk);
+    vif.wvalid <= 1;
+    vif.wdata  <= pkt.data;
+    vif.wid    <= pkt.id;
+    wait (vif.wready);
+    @(posedge vif.clk);
+    vif.wvalid <= 0;
+  endtask
+endclass
+class axi_monitor extends uvm_monitor;
+  `uvm_component_utils(axi_monitor)
+
+  virtual axi_if vif;
+  uvm_analysis_port #(axi_tx) b_port;
+
+  function new(string name, uvm_component parent);
+    super.new(name, parent);
+    b_port = new("b_port", this);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    if (!uvm_config_db#(virtual axi_if)::get(this, "", "vif", vif))
+      `uvm_fatal("MONITOR", "Cannot get vif handle")
+  endfunction
+
+  task run_phase(uvm_phase phase);
+    axi_tx pkt;
+    forever begin
+      @(posedge vif.clk);
+      if (vif.bvalid && vif.bready) begin
+        pkt = axi_tx::type_id::create("b_pkt", this);
+        pkt.id    = vif.bid;
+        pkt.resp  = vif.bresp;
+        b_port.write(pkt); // send response to driver
+        `uvm_info("MONITOR", $sformatf("B Channel: ID=%0d RESP=%0d", pkt.id, pkt.resp), UVM_MEDIUM)
+      end
+    end
+  endtask
+endclass
