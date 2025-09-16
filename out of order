@@ -169,3 +169,72 @@ endclass
 in_mon_h.ap.connect(sco_h.in_imp);
 out_mon_h.ap.connect(sco_h.out_imp);
 
+================================================================Driver ===============================================================================
+class drv extends uvm_driver #(packet);
+  `uvm_component_utils(drv)
+
+  virtual pkt_if vif;
+
+  function new(string name="drv", uvm_component parent=null);
+    super.new(name, parent);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    if (!uvm_config_db#(virtual pkt_if)::get(this, "", "vif", vif))
+      `uvm_fatal("NOVIF", "drv: virtual interface not set")
+  endfunction
+
+  // Drive bus to idle
+  task automatic drive_idle();
+    vif.valid <= 1'b0;
+    vif.id    <= '0;
+    vif.data  <= '0;
+    vif.last  <= 1'b0;
+  endtask
+
+  // Single-beat item drive (adjust for multi-beat if needed)
+  task automatic drive_item(packet tr);
+    // Apply on next clock
+    @(posedge vif.clk);
+    vif.id    <= tr.id;
+    vif.data  <= tr.data;
+    vif.last  <= 1'b1;     // single beat example
+    vif.valid <= 1'b1;
+
+    // Wait handshake
+    do @(posedge vif.clk); while (!vif.ready);
+
+    // Return to idle
+    vif.valid <= 1'b0;
+    vif.last  <= 1'b0;
+  endtask
+
+  task run_phase(uvm_phase phase);
+    packet req;
+    drive_idle();
+
+    // Wait for reset release
+    @(negedge vif.rst_n);
+    @(posedge vif.rst_n);
+    @(posedge vif.clk);
+
+    forever begin
+      seq_item_port.get_next_item(req);
+      drive_item(req);
+      seq_item_port.item_done();
+    end
+  endtask
+
+endclass
+------------------------------------------------------------multi beat -----------------------------------------------------------------------------------------------------
+for (int i=0; i<tr.len; i++) begin
+  @(posedge vif.clk);
+  vif.data  <= tr.data_q[i];
+  vif.id    <= tr.id;
+  vif.last  <= (i == tr.len-1);
+  vif.valid <= 1'b1;
+  do @(posedge vif.clk); while (!vif.ready);
+end
+vif.valid <= 1'b0; vif.last <= 1'b0;
+
