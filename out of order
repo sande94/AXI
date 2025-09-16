@@ -1,0 +1,171 @@
+// Declare 2 analysis_imp specializations
+`uvm_analysis_imp_decl(_in)
+`uvm_analysis_imp_decl(_out)
+
+class sco extends uvm_scoreboard;
+  `uvm_component_utils(sco)
+
+  // Two analysis imps: connect monitors here
+  uvm_analysis_imp_in #(packet, sco)  in_imp;
+  uvm_analysis_imp_out#(packet, sco)  out_imp;
+
+  // In/Out storage by id
+  packet in_map [int];
+  packet out_map[int];
+
+  // Expected storage by id + ready queues
+  packet exp_map[int];
+  int    in_q [$];
+  int    out_q[$];
+  int    exp_q[$];
+
+  event in_packet_triggered;
+
+  function new(string name="sco", uvm_component parent=null);
+    super.new(name, parent);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    in_imp  = new("in_imp",  this);
+    out_imp = new("out_imp", this);
+  endfunction
+
+  // ===== analysis writes from monitors =====
+  function void write_in(packet mon_in_pkt);
+    in_map[mon_in_pkt.id] = mon_in_pkt;
+    in_q.push_back(mon_in_pkt.id);
+    -> in_packet_triggered;
+  endfunction
+
+  function void write_out(packet mon_out_pkt);
+    out_map[mon_out_pkt.id] = mon_out_pkt;
+    out_q.push_back(mon_out_pkt.id);
+    // optional: kick compare here too
+    compare_data();
+  endfunction
+
+  // ===== main loop =====
+  task run_phase(uvm_phase phase);
+    forever begin
+      @(in_packet_triggered);
+      if (in_q.size() > 0) begin
+        int id = in_q.pop_front();
+        packet item = in_map[id];
+        process_data(item);
+        compare_data();
+      end
+    end
+  endtask
+
+  // Build expected from input
+  task process_data(packet item);
+    // Clone if packet is a class and DUT mutates it downstream
+    exp_map[item.id] = item.clone();
+    exp_q.push_back(item.id);
+  endtask
+
+  // Try to match expected vs actual by id
+  task compare_data();
+    // keep matching while both sides have something
+    while (exp_q.size() > 0 && out_q.size() > 0) begin
+      int id = exp_q.pop_front();
+
+      if (!out_map.exists(id)) begin
+        // actual not here yet; put id back and stop
+        exp_q.push_front(id);
+        break;
+      end
+
+      packet exp_item = exp_map[id];
+      packet act_item = out_map[id];
+
+      if (!exp_item.compare(act_item)) begin
+        `uvm_error("SCO", $sformatf("Mismatch for id %0d\nEXP:\n%s\nACT:\n%s",
+                                    id, exp_item.sprint(), act_item.sprint()))
+      end
+      else begin
+        `uvm_info("SCO", $sformatf("Match for id %0d", id), UVM_LOW)
+      end
+
+      // cleanup matched id
+      exp_map.delete(id);
+      out_map.delete(id);
+    end
+  endtask
+endclass
+-------------------------------------------------------- Monitor -----------------------------------------------------------------------------------------------
+// --------- IN MONITOR ----------
+class in_monitor extends uvm_monitor;
+  `uvm_component_utils(in_monitor)
+
+  uvm_analysis_port #(packet) ap;
+  virtual pkt_if vif;
+
+  function new(string name="in_monitor", uvm_component parent=null);
+    super.new(name, parent);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    if (!uvm_config_db#(virtual pkt_if)::get(this, "", "vif", vif))
+      `uvm_fatal("NOVIF", "in_monitor: virtual interface not set")
+    ap = new("ap", this);
+  endfunction
+
+  task run_phase(uvm_phase phase);
+    packet tr;
+    forever begin
+      @(posedge vif.clk);
+      if (!vif.rst_n) continue;
+
+      // Single-beat example (one transfer per valid&ready)
+      if (vif.valid && vif.ready) begin
+        tr = packet::type_id::create("in_tr", this);
+        tr.id   = vif.id;
+        tr.data = vif.data;     // adjust to your packet fields
+        // if multi-beat: accumulate until vif.last == 1'b1
+        ap.write(tr);
+      end
+    end
+  endtask
+endclass
+
+// --------- OUT MONITOR ----------
+class out_monitor extends uvm_monitor;
+  `uvm_component_utils(out_monitor)
+
+  uvm_analysis_port #(packet) ap;
+  virtual pkt_if vif;
+
+  function new(string name="out_monitor", uvm_component parent=null);
+    super.new(name, parent);
+  endfunction
+
+  function void build_phase(uvm_phase phase);
+    super.build_phase(phase);
+    if (!uvm_config_db#(virtual pkt_if)::get(this, "", "vif", vif))
+      `uvm_fatal("NOVIF", "out_monitor: virtual interface not set")
+    ap = new("ap", this);
+  endfunction
+
+  task run_phase(uvm_phase phase);
+    packet tr;
+    forever begin
+      @(posedge vif.clk);
+      if (!vif.rst_n) continue;
+
+      if (vif.valid && vif.ready) begin
+        tr = packet::type_id::create("out_tr", this);
+        tr.id   = vif.id;
+        tr.data = vif.data;     // adjust to your packet fields
+        ap.write(tr);
+      end
+    end
+  endtask
+endclass
+-----------------------------------------------------------------connections-----------------------------------------------------------------------
+// assuming handles: in_mon_h, out_mon_h, sco_h
+in_mon_h.ap.connect(sco_h.in_imp);
+out_mon_h.ap.connect(sco_h.out_imp);
+
